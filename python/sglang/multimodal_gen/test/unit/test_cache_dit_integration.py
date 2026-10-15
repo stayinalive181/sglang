@@ -19,6 +19,7 @@ class _FakeDBCacheConfig:
 class _FakeForwardPattern:
     # A class (not a SimpleNamespace instance) so it is a valid type in
     # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_1 = "Pattern_1"
     Pattern_2 = "Pattern_2"
     Pattern_3 = "Pattern_3"
 
@@ -378,6 +379,39 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertTrue(adapter.has_separate_cfg)
         self.assertIs(adapter.blocks, transformer.transformer_blocks)
+
+    def test_flux3_caches_the_single_stream_trunk(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("Flux3ImageDiT")
+        transformer.single_blocks = blocks
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        # Only the joint trunk is cacheable: the per-modality mode blocks are a
+        # ModuleDict iterated depth-major, which a BlockAdapter cannot express.
+        self.assertEqual(adapter.blocks, blocks)
+        # `txt, img = block(img, txt, ...)`: (hidden, encoder) in, (encoder,
+        # hidden) out, i.e. Pattern_1 -- but named img/txt, so the name-based
+        # pattern check has to be off.
+        self.assertEqual(adapter.forward_pattern, "Pattern_1")
+        self.assertFalse(adapter.check_forward_pattern)
+
+    def test_explicit_spec_wins_over_the_registry(self):
+        # kills: deferring to cache-dit's registry when a spec exists. The
+        # registry matches by class-name prefix, so Flux3ImageDiT resolves to
+        # the diffusers Flux adapter and dies on `transformer_blocks`.
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = True
+        transformer = _make_transformer("Flux3ImageDiT")
+        transformer.single_blocks = ["block_0"]
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=28)
+
+        module.enable_cache_on_transformer(transformer, config)
+
+        adapter = transformer._sglang_cache_dit_adapter
+        self.assertEqual(adapter.blocks, ["block_0"])
+        self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
 
     def test_custom_adapter_is_retained_until_disable(self):
         module = _import_module_with_stub()

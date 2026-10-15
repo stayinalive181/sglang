@@ -243,6 +243,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
         "AnimaPipelineConfig",
+        "Flux3ImagePipelineConfig",
         "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
@@ -260,6 +261,13 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
     }
+)
+
+# Pipeline configs identified purely by ``--pipeline-class-name`` (their weights
+# are local paths, not HuggingFace ids), so the model-id whitelist does not
+# apply: selecting the pipeline is already an explicit opt-in.
+BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS = frozenset(
+    {"Flux3ImagePipelineConfig"}
 )
 
 
@@ -793,9 +801,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         pipeline_config = getattr(self, "pipeline_config", None)
         pipeline_config_name = type(pipeline_config).__name__
-        if (
-            pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
-            and self._is_breakable_cuda_graph_supported_model()
+        if pipeline_config_name in BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS and (
+            pipeline_config_name
+            in BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS
+            or self._is_breakable_cuda_graph_supported_model()
         ):
             if not self.warmup_resolutions:
                 self._default_bcg_warmup_resolution()

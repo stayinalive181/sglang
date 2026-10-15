@@ -7,12 +7,15 @@ import torch
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
     _CaptureEntry,
+    _flatten_kwargs,
+    _map_tensors,
     _signature_kwargs,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     DynamicVarlenMaskMeta,
     build_varlen_mask_meta,
 )
+from sglang.multimodal_gen.runtime.models.dits.flux3_image import Packed
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
@@ -117,6 +120,43 @@ class TestQualityFusionBCGCompatibility(unittest.TestCase):
 
         self.assertEqual(mounted, [True])
         self.assertTrue(self.stage._quality_fusions_mounted)
+
+
+class TestBCGDataclassInputs(unittest.TestCase):
+    def test_packed_tensor_leaves_are_mapped_and_flattened(self):
+        packed = Packed(
+            data={"image": torch.zeros(2, 3)},
+            ids={"image": torch.zeros(2, 4)},
+            timesteps={"image": torch.zeros(2)},
+            mode_indices={"image": [(0, 1), (1, 2)]},
+        )
+        mapped = _map_tensors(packed, lambda tensor: tensor + 1)
+        self.assertIsInstance(mapped, Packed)
+        self.assertTrue(torch.equal(mapped.data["image"], torch.ones(2, 3)))
+        self.assertEqual(mapped.mode_indices, packed.mode_indices)
+        leaves = _flatten_kwargs({"packed": mapped})
+        self.assertEqual(len(leaves), 3)
+        self.assertEqual(
+            _signature_kwargs({"packed": packed}),
+            _signature_kwargs({"packed": mapped}),
+        )
+
+        shorter = Packed(
+            data={"image": torch.zeros(2, 3), "text": torch.zeros(2, 5)},
+            ids={"image": torch.zeros(2, 4), "text": torch.zeros(2, 4)},
+            timesteps={"image": torch.zeros(2), "text": torch.zeros(2)},
+            mode_indices={"image": [(0, 1), (1, 2)], "text": [(0, 1), (1, 2)]},
+        )
+        longer = Packed(
+            data={"image": torch.zeros(2, 3), "text": torch.zeros(4, 5)},
+            ids={"image": torch.zeros(2, 4), "text": torch.zeros(4, 4)},
+            timesteps={"image": torch.zeros(2), "text": torch.zeros(4)},
+            mode_indices={"image": [(0, 1), (1, 2)], "text": [(0, 2), (2, 4)]},
+        )
+        self.assertNotEqual(
+            _signature_kwargs({"packed": shorter}),
+            _signature_kwargs({"packed": longer}),
+        )
 
 
 def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:

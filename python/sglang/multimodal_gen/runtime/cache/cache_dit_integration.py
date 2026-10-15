@@ -399,6 +399,7 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 class CustomBlockAdapterSpec:
     blocks_attr: str
     forward_pattern: ForwardPattern
+    check_forward_pattern: bool = True
 
 
 # Custom BlockAdapter metadata for models absent from cache-dit's registry.
@@ -427,6 +428,11 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    "Flux3ImageDiT": CustomBlockAdapterSpec(
+        blocks_attr="single_blocks",
+        forward_pattern=ForwardPattern.Pattern_1,
+        check_forward_pattern=False,
+    ),
 }
 
 
@@ -450,6 +456,7 @@ def _build_custom_block_adapter(
         blocks=blocks,
         forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
+        check_forward_pattern=spec.check_forward_pattern,
     )
 
 
@@ -519,8 +526,8 @@ def enable_cache_on_transformer(
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
         has_separate_cfg: Whether the run issues separate conditional/unconditional
-            passes per step (CFG). Used by custom adapters (ERNIE, Krea-2); a
-            mismatch only disables caching, never corrupts output.
+            passes per step in the same cache context. Used by custom adapters;
+            a mismatch misaligns step counts and residual reuse.
 
     """
     if not config.enabled:
@@ -638,10 +645,17 @@ def enable_cache_on_transformer(
             context_manager._sglang_sp_group = sp_group
             context_manager._sglang_tp_group = tp_group
             # In mixed TP + SP (Ulysses/Ring) mode, cache-dit decisions must be consistent
-            # across the full TP×SP model-parallel slice. Prefer using SGLang's DIT group
-            # as a conservative superset group; fallback to None.
+            # across the full TP×SP model-parallel slice. CFG parallelism needs the same
+            # treatment. Prefer using SGLang's DIT group as a conservative superset group;
+            # fallback to None.
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_classifier_free_guidance_world_size,
+            )
+
             tp_sp_group = None
-            if sp_group is not None and tp_group is not None:
+            if (sp_group is not None and tp_group is not None) or (
+                get_classifier_free_guidance_world_size() > 1
+            ):
                 tp_sp_group = get_dit_group()
 
             context_manager._sglang_tp_sp_group = tp_sp_group
