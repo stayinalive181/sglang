@@ -1,20 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict resolver for the FLUX.3 image-small model package."""
+"""Resolver for FLUX.3 image (Klein) packages, local or on the Hugging Face Hub."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import msgspec
+from huggingface_hub.utils import validate_repo_id
+from safetensors import safe_open
+
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import snapshot_download
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 FORMAT_VERSION = 1
-MODEL_NAME = "f3-image-small"
+# Both release repos use flux-3-image-klein in their config and weight metadata.
+# Sampling mode comes from the weights, not this shared identifier.
+MODEL_NAMES = ("flux-3-image-klein", "flux-3-image-klein-base")
 CONFIG_NAME = "config.json"
 MANIFEST_NAME = "manifest.json"
 WEIGHTS_NAME = "model.safetensors"
 QUANT_CONFIG_NAME = "hf_quant_config.json"
+# hf://<namespace>/<repo>/<path>: an asset in another Hub repo (split checkpoints).
+HF_ASSET_PREFIX = "hf://"
+# The BFL reference tells a flow-map DiT from its weights, never from config.json.
+FLOW_MAP_KEY = "ref_time_in.in_layer.weight"
 FP8R_VARIANT = "fp8r"
 NVFP4_VARIANT = "nvfp4"
+QUANTIZATIONS = (FP8R_VARIANT, NVFP4_VARIANT)
 # The NVFP4 decode the runtime implements; a manifest must state every clause.
 _NVFP4_SCALE_CLAUSES = (
     "e2m1(weight) * weight_scale[:, k // 16] * weight_scale_2",
@@ -51,7 +68,8 @@ class Flux3ImageDiTPackageConfig:
     vec_in_dim: int | None = None
     image_rope_scale: float = 0.5
     # A flow-map DiT also embeds the time each step jumps to (``ref_time_in``).
-    flow_map: bool = False
+    # ``None`` until resolution reads it from the weights.
+    flow_map: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -73,10 +91,10 @@ class Flux3ImageVAEPackageConfig:
 @dataclass(frozen=True)
 class Flux3ImageSamplerPackageConfig:
     steps: int
-    # CFG scale; ``None`` for a flow map, which samples without CFG.
-    guidance: float | None
     alpha: float
     size: tuple[int, int]
+    # CFG scale; ``None`` for a flow map, which samples without CFG.
+    guidance: float | None = None
 
 
 @dataclass(frozen=True)
@@ -92,38 +110,10 @@ class Flux3ImagePackageConfig:
 
     @classmethod
     def from_dict(cls, raw: dict) -> Flux3ImagePackageConfig:
-        raw = _section(
-            raw,
-            cls,
-            "config",
-            nested={"dit", "text_encoder", "vae", "sampler"},
-        )
-        config = cls(
-            **{
-                key: value
-                for key, value in raw.items()
-                if key not in ("dit", "text_encoder", "vae", "sampler")
-            },
-            dit=_build(
-                Flux3ImageDiTPackageConfig,
-                raw["dit"],
-                "dit",
-                tuples=("axes_dim", "out_modes"),
-            ),
-            text_encoder=_build(
-                Flux3ImageTextEncoderPackageConfig,
-                raw["text_encoder"],
-                "text_encoder",
-                tuples=("layers",),
-            ),
-            vae=_build(Flux3ImageVAEPackageConfig, raw["vae"], "vae"),
-            sampler=_build(
-                Flux3ImageSamplerPackageConfig,
-                raw["sampler"],
-                "sampler",
-                tuples=("size",),
-            ),
-        )
+        try:
+            config = msgspec.convert(raw, type=cls)
+        except msgspec.ValidationError as exc:
+            raise Flux3ImagePackageError(str(exc)) from exc
         _validate_config(config)
         return config
 
@@ -136,7 +126,8 @@ class Flux3ImagePackage:
     vae: Path
     text_encoder: Path
     tokenizer: Path
-    manifest: Path
+    # Optional for a BF16 DiT; a quantized DiT needs it for its scale convention.
+    manifest: Path | None
     directory: Path | None = None
     variant: str | None = None
     quant_config: Path | None = None
@@ -159,10 +150,13 @@ def load_flux3_image_package_config(path: str | Path) -> Flux3ImagePackageConfig
 
 
 def resolve_flux3_image_package(
-    source: str | Path, variant: str | None = None
+    source: str | Path, variant: str | None = None, revision: str | None = None
 ) -> Flux3ImagePackage:
-    """Resolve the BF16 root package or a supported shared-asset variant."""
+    """Resolve a package root, one of its variants, or a Hub repo id; a Hub
+    package downloads only the files the selected DiT needs."""
     directory = Path(source).expanduser()
+    if not directory.exists() and _is_hub_repo_id(str(source)):
+        directory = _download_package(str(source), variant=variant, revision=revision)
     if directory.is_file():
         if directory.name not in {
             CONFIG_NAME,
@@ -176,7 +170,10 @@ def resolve_flux3_image_package(
             )
         directory = directory.parent
     if not directory.is_dir():
-        raise Flux3ImagePackageError(f"FLUX.3 package directory not found: {directory}")
+        raise Flux3ImagePackageError(
+            f"FLUX.3 package not found: {source} is neither a local directory "
+            "nor a Hugging Face repo id"
+        )
 
     direct_variant = directory.parent.name == "variants"
     if direct_variant:
@@ -190,29 +187,26 @@ def resolve_flux3_image_package(
     else:
         root = directory
         if variant is not None:
+            variant = _existing_variant(root, variant)
             directory = root / "variants" / variant
-
-    if variant is not None and variant not in VARIANT_QUANTIZATION:
-        raise Flux3ImagePackageError(
-            f"unsupported FLUX.3 package variant {variant!r}; "
-            f"supported variants: {', '.join(map(repr, VARIANT_QUANTIZATION))}"
-        )
     if not directory.is_dir():
+        available = sorted(
+            path.parent.name for path in root.glob(f"variants/*/{CONFIG_NAME}")
+        )
         raise Flux3ImagePackageError(
-            f"FLUX.3 package variant {variant!r} not found: {directory}"
+            f"unsupported FLUX.3 package variant {variant!r}: {directory} does not "
+            f"exist; this package has {available or 'no variants'}"
         )
 
     config = load_flux3_image_package_config(directory / CONFIG_NAME)
-    if config.model != MODEL_NAME:
-        raise Flux3ImagePackageError(
-            f"unsupported FLUX.3 package model {config.model!r}; expected {MODEL_NAME!r}"
+    if config.model not in MODEL_NAMES:
+        logger.debug(
+            "FLUX.3 package model %r is not one of %s; loading it as FLUX.3 image "
+            "since its config has the image DiT layout",
+            config.model,
+            ", ".join(MODEL_NAMES),
         )
-    expected_quantization = VARIANT_QUANTIZATION.get(variant)
-    if config.quantization != expected_quantization:
-        raise Flux3ImagePackageError(
-            f"FLUX.3 package variant {variant!r} requires "
-            f"quantization={expected_quantization!r}, got {config.quantization!r}"
-        )
+    _check_quantization(config, variant)
     if config.torch_dtype != "bfloat16":
         raise Flux3ImagePackageError(
             f"FLUX.3 package expected torch_dtype='bfloat16', "
@@ -220,24 +214,24 @@ def resolve_flux3_image_package(
         )
 
     weights = directory / WEIGHTS_NAME
-    vae = root / _relative(config.vae.path, "vae.path")
-    text_encoder = root / _relative(config.text_encoder.path, "text_encoder.path")
-    tokenizer = root / _relative(
-        config.text_encoder.tokenizer, "text_encoder.tokenizer"
+    vae = _resolve_asset(root, config.vae.path, "vae.path")
+    text_encoder = _resolve_asset(root, config.text_encoder.path, "text_encoder.path")
+    tokenizer = _resolve_asset(
+        root, config.text_encoder.tokenizer, "text_encoder.tokenizer"
     )
     manifest = directory / MANIFEST_NAME
     quant_config = (
-        directory / QUANT_CONFIG_NAME if expected_quantization is not None else None
+        directory / QUANT_CONFIG_NAME if config.quantization is not None else None
     )
     required = {
         "DiT weights": weights,
         "image VAE": vae,
         "text encoder": text_encoder,
         "tokenizer": tokenizer,
-        "manifest": manifest,
     }
     if quant_config is not None:
-        required[f"{expected_quantization.upper()} quantization config"] = quant_config
+        required["manifest"] = manifest
+        required[f"{config.quantization.upper()} quantization config"] = quant_config
     missing = [
         f"{name}: {path}" for name, path in required.items() if not path.exists()
     ]
@@ -245,52 +239,136 @@ def resolve_flux3_image_package(
         raise Flux3ImagePackageError(
             "FLUX.3 package is incomplete; missing " + ", ".join(missing)
         )
-    _validate_manifest(manifest, config)
+    if manifest.exists():
+        _validate_manifest(manifest, config)
     return Flux3ImagePackage(
         root=root,
-        config=config,
+        config=_resolve_flow_map(config, weights),
         weights=weights,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        manifest=manifest,
+        manifest=manifest if manifest.exists() else None,
         directory=directory,
         variant=variant,
         quant_config=quant_config,
     )
 
 
-def _section(raw, cls, name: str, nested=frozenset()) -> dict:
-    if not isinstance(raw, dict):
-        raise Flux3ImagePackageError(
-            f"{name} must be an object, got {type(raw).__name__}"
+def _existing_variant(root: Path, variant: str) -> str:
+    # The distilled repo may keep the combined package's sd-fp8r/sd-nvfp4 names;
+    # fp8r/nvfp4 then select them. Never the reverse: sd-* must stay distilled.
+    alias = f"sd-{variant}"
+    if (root / "variants" / variant).is_dir() or alias not in VARIANT_QUANTIZATION:
+        return variant
+    if (root / "variants" / alias).is_dir():
+        logger.info("FLUX.3 package variant %r not found; using %r", variant, alias)
+        return alias
+    return variant
+
+
+def _check_quantization(config: Flux3ImagePackageConfig, variant: str | None) -> None:
+    _check(
+        config.quantization is None or config.quantization in QUANTIZATIONS,
+        f"unsupported FLUX.3 package quantization {config.quantization!r}",
+    )
+    # A known variant name pins its quantization; a package root or another
+    # name (e.g. a standalone quantized repo) takes the config's.
+    if variant in VARIANT_QUANTIZATION:
+        expected = VARIANT_QUANTIZATION[variant]
+        _check(
+            config.quantization == expected,
+            f"FLUX.3 package variant {variant!r} requires "
+            f"quantization={expected!r}, got {config.quantization!r}",
         )
-    names = {item.name for item in fields(cls)}
-    required = {
-        item.name
-        for item in fields(cls)
-        if item.default is MISSING and item.default_factory is MISSING
-    }
-    unknown = set(raw) - names
-    missing = required - set(raw)
-    if unknown:
-        raise Flux3ImagePackageError(f"unknown key(s) in {name}: {sorted(unknown)}")
-    if missing:
-        raise Flux3ImagePackageError(f"missing key(s) in {name}: {sorted(missing)}")
-    for key in nested:
-        if not isinstance(raw.get(key), dict):
-            raise Flux3ImagePackageError(f"{name}.{key} must be an object")
-    return raw
 
 
-def _build(cls, raw, name: str, tuples=()):
-    raw = dict(_section(raw, cls, name))
-    for key in tuples:
-        if key in raw:
-            if not isinstance(raw[key], list):
-                raise Flux3ImagePackageError(f"{name}.{key} must be a list")
-            raw[key] = tuple(raw[key])
-    return cls(**raw)
+def _resolve_flow_map(
+    config: Flux3ImagePackageConfig, weights: Path
+) -> Flux3ImagePackageConfig:
+    flow_map = config.dit.flow_map
+    if flow_map is None:
+        flow_map = _has_flow_map_weights(weights)
+    sampler = config.sampler
+    if flow_map and sampler.guidance is not None:
+        logger.warning(
+            "FLUX.3 package %s is a flow map, which samples without CFG; "
+            "ignoring sampler.guidance=%s",
+            weights,
+            sampler.guidance,
+        )
+        sampler = dataclasses.replace(sampler, guidance=None)
+    _check(
+        flow_map or _is_num(sampler.guidance),
+        "sampler.guidance must be numeric for a CFG (non-flow-map) DiT",
+    )
+    return dataclasses.replace(
+        config, dit=dataclasses.replace(config.dit, flow_map=flow_map), sampler=sampler
+    )
+
+
+def _has_flow_map_weights(weights: Path) -> bool:
+    try:
+        with safe_open(str(weights), framework="pt") as f:
+            return FLOW_MAP_KEY in f.keys()
+    except Exception as exc:
+        raise Flux3ImagePackageError(
+            f"{weights}: cannot read the safetensors header ({exc})"
+        ) from None
+
+
+def _is_hub_repo_id(source: str) -> bool:
+    if source.startswith(("/", ".", "~")) or source.count("/") != 1:
+        return False
+    try:
+        validate_repo_id(source)
+    except ValueError:
+        return False
+    return True
+
+
+def _hub_snapshot(
+    repo_id: str, *, patterns: list[str], revision: str | None = None
+) -> Path:
+    try:
+        return Path(
+            snapshot_download(
+                repo_id=repo_id, allow_patterns=patterns, revision=revision
+            )
+        )
+    except Exception as exc:
+        raise Flux3ImagePackageError(
+            f"could not fetch {patterns} from Hugging Face repo {repo_id!r}: {exc}"
+        ) from exc
+
+
+def _asset_patterns(path: str) -> list[str]:
+    # Hub patterns are fnmatch globs, where ``*`` also crosses ``/``.
+    return [path, f"{path}/*"]
+
+
+def _download_package(
+    repo_id: str, *, variant: str | None, revision: str | None
+) -> Path:
+    prefix = f"variants/{variant}/" if variant else ""
+    root = _hub_snapshot(
+        repo_id,
+        patterns=[
+            prefix + name for name in (CONFIG_NAME, MANIFEST_NAME, QUANT_CONFIG_NAME)
+        ],
+        revision=revision,
+    )
+    config = load_flux3_image_package_config(root / prefix / CONFIG_NAME)
+    patterns = [prefix + WEIGHTS_NAME]
+    for reference in (
+        config.vae.path,
+        config.text_encoder.path,
+        config.text_encoder.tokenizer,
+    ):
+        if not reference.startswith(HF_ASSET_PREFIX):
+            patterns += _asset_patterns(reference)
+    _hub_snapshot(repo_id, patterns=patterns, revision=revision)
+    return root
 
 
 def _check(condition: bool, message: str) -> None:
@@ -318,6 +396,39 @@ def _relative(path: str, what: str) -> str:
     return path
 
 
+def _hub_asset(path: str, what: str) -> tuple[str, str] | None:
+    if not isinstance(path, str) or not path.startswith(HF_ASSET_PREFIX):
+        return None
+    raw = path.removeprefix(HF_ASSET_PREFIX)
+    value = PurePosixPath(raw)
+    _check(
+        not value.is_absolute() and ".." not in value.parts and len(value.parts) >= 3,
+        f"{what} must use hf://<namespace>/<repo>/<path>, got {path!r}",
+    )
+    repo_id = "/".join(value.parts[:2])
+    _check(_is_hub_repo_id(repo_id), f"{what} has an invalid Hub repo in {path!r}")
+    return repo_id, "/".join(value.parts[2:])
+
+
+def _asset_reference(path: str, what: str) -> str:
+    if _hub_asset(path, what) is None:
+        _relative(path, what)
+    return path
+
+
+def _resolve_asset(root: Path, reference: str, what: str) -> Path:
+    hub_asset = _hub_asset(reference, what)
+    if hub_asset is None:
+        return root / _relative(reference, what)
+    repo_id, asset_path = hub_asset
+    # Prefer a sibling checkout laid out as <namespace>/<repo>, as the Hub names it.
+    namespace, repo_name = repo_id.split("/")
+    sibling = root.parent / repo_name / asset_path
+    if root.parent.name == namespace and sibling.exists():
+        return sibling
+    return _hub_snapshot(repo_id, patterns=_asset_patterns(asset_path)) / asset_path
+
+
 def _validate_config(config: Flux3ImagePackageConfig) -> None:
     _check(
         config.format_version == FORMAT_VERSION,
@@ -328,9 +439,15 @@ def _validate_config(config: Flux3ImagePackageConfig) -> None:
         f"unsupported torch_dtype {config.torch_dtype!r}",
     )
     dit = config.dit
-    for key in ("hidden", "heads", "depth", "depth_single", "theta"):
+    for key, value in (
+        ("hidden", dit.hidden),
+        ("heads", dit.heads),
+        ("depth", dit.depth),
+        ("depth_single", dit.depth_single),
+        ("theta", dit.theta),
+    ):
         _check(
-            _is_int(getattr(dit, key)) and getattr(dit, key) > 0,
+            value > 0,
             f"dit.{key} must be a positive integer",
         )
     _check(
@@ -347,21 +464,24 @@ def _validate_config(config: Flux3ImagePackageConfig) -> None:
     )
     _check(
         dit.in_channels == {"image": 128, "image_cond": 128, "text": 20480},
-        f"unsupported image-small channels: {dit.in_channels}",
+        f"unsupported FLUX.3 Klein channels: {dit.in_channels}",
     )
     _check(
         dit.out_modes == ("image",),
-        f"unsupported image-small output modes: {dit.out_modes}",
+        f"unsupported FLUX.3 Klein output modes: {dit.out_modes}",
     )
-    _check(dit.vec_in_dim is None, "image-small must not define vec_in_dim")
+    _check(dit.vec_in_dim is None, "FLUX.3 Klein must not define vec_in_dim")
     _check(
         _is_num(dit.image_rope_scale) and dit.image_rope_scale > 0,
         "dit.image_rope_scale must be positive",
     )
-    _check(isinstance(dit.flow_map, bool), "dit.flow_map must be a boolean")
+    _check(
+        dit.flow_map is None or isinstance(dit.flow_map, bool),
+        "dit.flow_map must be a boolean",
+    )
     text = config.text_encoder
-    _relative(text.path, "text_encoder.path")
-    _relative(text.tokenizer, "text_encoder.tokenizer")
+    _asset_reference(text.path, "text_encoder.path")
+    _asset_reference(text.tokenizer, "text_encoder.tokenizer")
     _check(bool(text.layers), "text_encoder.layers must not be empty")
     _check(
         _is_int(text.pad_multiple) and text.pad_multiple > 0,
@@ -371,7 +491,7 @@ def _validate_config(config: Flux3ImagePackageConfig) -> None:
         _is_int(text.max_tokens) and text.max_tokens >= text.pad_multiple,
         "text_encoder.max_tokens must be >= pad_multiple",
     )
-    _relative(config.vae.path, "vae.path")
+    _asset_reference(config.vae.path, "vae.path")
     _check(
         config.vae.dtype in TORCH_DTYPES,
         f"unsupported VAE dtype {config.vae.dtype!r}",
@@ -380,10 +500,10 @@ def _validate_config(config: Flux3ImagePackageConfig) -> None:
     _check(
         _is_int(sampler.steps) and sampler.steps > 0, "sampler.steps must be positive"
     )
-    if config.dit.flow_map:
-        _check(sampler.guidance is None, "a flow-map sampler.guidance must be null")
-    else:
-        _check(_is_num(sampler.guidance), "sampler.guidance must be numeric")
+    _check(
+        sampler.guidance is None or _is_num(sampler.guidance),
+        "sampler.guidance must be numeric or null",
+    )
     _check(
         _is_num(sampler.alpha) and sampler.alpha > 0,
         "sampler.alpha must be positive",
@@ -406,10 +526,13 @@ def _validate_manifest(path: Path, config: Flux3ImagePackageConfig) -> None:
         manifest.get("format_version") == 1,
         f"{path}: unsupported manifest format_version",
     )
-    _check(
-        manifest.get("model", config.model) == config.model,
-        f"{path}: manifest model does not match config",
-    )
+    if manifest.get("model", config.model) != config.model:
+        logger.warning(
+            "%s: manifest model %r differs from config model %r",
+            path,
+            manifest.get("model"),
+            config.model,
+        )
     _check(
         manifest.get("quantization", config.quantization) == config.quantization,
         f"{path}: manifest quantization does not match config",

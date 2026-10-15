@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.numerics import round_bf16_to_fp32
+from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 

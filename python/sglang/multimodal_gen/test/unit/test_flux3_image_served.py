@@ -29,6 +29,7 @@ def _config_dict():
             "out_modes": ["image"],
             "vec_in_dim": None,
             "image_rope_scale": 0.5,
+            "flow_map": False,
         },
         "text_encoder": {
             "path": "text_encoder",
@@ -114,6 +115,7 @@ class TestFlux3ServedRegistration(unittest.TestCase):
                     SimpleNamespace(
                         model_path=str(root),
                         model_variant=variant,
+                        revision=None,
                         enable_cfg_parallel=False,
                     )
                 )
@@ -138,6 +140,7 @@ class TestFlux3ServedRegistration(unittest.TestCase):
                     SimpleNamespace(
                         model_path=str(root),
                         model_variant="sd",
+                        revision=None,
                         enable_cfg_parallel=True,
                     )
                 )
